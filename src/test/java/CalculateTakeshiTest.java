@@ -13,8 +13,9 @@ public class CalculateTakeshiTest {
         var old = System.out;
         try (var pw = new PrintStream(bout)) {
             System.setOut(pw);
-            CalculateAverage_mtakeshi.main(new String[]{input});
-        } finally {
+            CalculateAverage_mtakeshi.main(new String[]{ input });
+        }
+        finally {
             System.setOut(old);
         }
         return bout.toString();
@@ -63,12 +64,10 @@ public class CalculateTakeshiTest {
         testSample(20);
     }
 
-
     @Test
     public void test10000() throws Exception {
         testSample("10000-unique-keys");
     }
-
 
     @Test
     public void testBoundaries() throws Exception {

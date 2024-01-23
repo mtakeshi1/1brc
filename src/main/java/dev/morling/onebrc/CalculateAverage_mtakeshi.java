@@ -16,17 +16,25 @@
 package dev.morling.onebrc;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.io.RandomAccessFile;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collector;
-
-import static java.util.stream.Collectors.groupingBy;
 
 public class CalculateAverage_mtakeshi {
 
     private static final String FILE = "./measurements.txt";
+
+    private static final int PIECE_LEN = 40 * 1024 * 1024;
 
     private record Measurement(String station, double value) {
         private Measurement(String[] parts) {
@@ -46,22 +54,41 @@ public class CalculateAverage_mtakeshi {
     }
 
     private static class MeasurementAggregator {
+
+        public MeasurementAggregator() {
+        }
+
+        public MeasurementAggregator(double v) {
+            this.min = v;
+            this.max = v;
+            this.sum = v;
+            this.count = 1;
+        }
+
         private double min = Double.POSITIVE_INFINITY;
         private double max = Double.NEGATIVE_INFINITY;
         private double sum;
         private long count;
+
+        public MeasurementAggregator combine(MeasurementAggregator measurementAggregator) {
+            var res = new MeasurementAggregator();
+            res.min = Math.min(this.min, measurementAggregator.min);
+            res.max = Math.max(this.max, measurementAggregator.max);
+            res.sum = this.sum + measurementAggregator.sum;
+            res.count = this.count + measurementAggregator.count;
+
+            return res;
+        }
+
+        public void append(double x) {
+            this.min = Math.min(this.min, x);
+            this.max = Math.max(this.max, x);
+            this.sum += x;
+            this.count++;
+        }
     }
 
     public static void main(String[] args) throws IOException {
-        // Map<String, Double> measurements1 = Files.lines(Paths.get(FILE))
-        // .map(l -> l.split(";"))
-        // .collect(groupingBy(m -> m[0], averagingDouble(m -> Double.parseDouble(m[1]))));
-        //
-        // measurements1 = new TreeMap<>(measurements1.entrySet()
-        // .stream()
-        // .collect(toMap(e -> e.getKey(), e -> Math.round(e.getValue() * 10.0) / 10.0)));
-        // System.out.println(measurements1);
-
         Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
                 MeasurementAggregator::new,
                 (a, m) -> {
@@ -83,13 +110,83 @@ public class CalculateAverage_mtakeshi {
 
         var file = args.length == 0 ? FILE : args[0];
 
-        try (var lines = Files.lines(Paths.get(file))) {
-            Map<String, ResultRow> measurements = new TreeMap<>(
-                    lines
-                            .map(l -> new Measurement(l.split(";")))
-                            .collect(groupingBy(Measurement::station, collector))
-            );
+        try (var raf = new RandomAccessFile(file, "r"); ExecutorService executor = Executors.newFixedThreadPool(16)) {
+            FileChannel channel = raf.getChannel();
+            // channel.ma
+            long lastOffset = 0;
+            long offset = Math.min(PIECE_LEN, raf.length());
+            var seg = channel.map(FileChannel.MapMode.READ_ONLY, 0, raf.length(), Arena.global());
+            var futures = new ArrayList<Future<Map<String, MeasurementAggregator>>>(100000); // yes lazy
+            while (offset < raf.length()) {
+                while (offset < raf.length() && seg.get(ValueLayout.OfByte.JAVA_BYTE, offset) != '\n') {
+                    offset++;
+                }
+                var piece = seg.asSlice(lastOffset, offset - lastOffset);
+                lastOffset = offset;
+                offset = Math.min(offset + PIECE_LEN, raf.length());
+                futures.add(submitTask(executor, piece));
+            }
+            if (offset > lastOffset) {
+                futures.add(submitTask(executor, seg.asSlice(lastOffset, offset - lastOffset)));
+            }
+            Map<String, MeasurementAggregator> finalResult = new HashMap<>(100000);
+            futures.stream().parallel().map(CalculateAverage_mtakeshi::waitRethrow).forEach(map -> map.forEach((station, result) -> {
+                finalResult.merge(station, result, MeasurementAggregator::combine);
+            }));
+            Map<String, ResultRow> measurements = new TreeMap<>();
+            finalResult.forEach((k, v) -> {
+                measurements.put(k.trim(), new ResultRow(v.min, (Math.round(v.sum * 10.0) / 10.0) / v.count, v.max));
+            });
             System.out.println(measurements);
         }
+    }
+
+    private static <E> E waitRethrow(Future<E> future) {
+        try {
+            return future.get();
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static Map<String, MeasurementAggregator> task(MemorySegment piece) {
+        Map<String, MeasurementAggregator> map = new HashMap<>();
+        long i = 0;
+        byte[] buffer = new byte[100];
+        while (i < piece.byteSize()) {
+            byte b;
+            int j = 0;
+            while ((b = piece.get(ValueLayout.JAVA_BYTE, i++)) != ';') {
+                if (b != '\n') buffer[j++] = b;
+            }
+            int sig = 1;
+            double v = 0;
+            if ((b = piece.get(ValueLayout.JAVA_BYTE, i++)) == '-') {
+                sig = -1;
+            } else {
+                v = b - '0';
+            }
+            while ((b = piece.get(ValueLayout.JAVA_BYTE, i++)) != '.') {
+                int digit = b - '0';
+                v = (v * 10) + digit;
+            }
+            b = piece.get(ValueLayout.JAVA_BYTE, i++);
+            int digit = b - '0';
+            if (digit > 0) {
+                v += digit / 10.0;
+            }
+            map.merge(new String(buffer, 0, j), new MeasurementAggregator(sig * v), MeasurementAggregator::combine);
+            if (i < piece.byteSize()) {
+                if ((b = piece.get(ValueLayout.JAVA_BYTE, i++)) != '\n') {
+                    throw new RuntimeException(STR."expected EOL but got '\{Character.toString(b)}' ");
+                }
+            }
+        }
+        return map;
+    }
+
+    private static Future<Map<String, MeasurementAggregator>> submitTask(ExecutorService executor, MemorySegment piece) {
+        return executor.submit(() -> task(piece));
     }
 }
